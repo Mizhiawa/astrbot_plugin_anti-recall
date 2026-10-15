@@ -1,0 +1,26 @@
+{
+  "window_minutes": {
+    "description": "查询时间窗口（分钟）",
+    "type": "int",
+    "hint": "发送查询指令时，只输出最近这么多分钟内被撤回的消息",
+    "default": 10
+  },
+  "cache_minutes": {
+    "description": "消息缓存时长（分钟）",
+    "type": "int",
+    "hint": "机器人缓存消息的时长，建议不小于查询时间窗口。超过该时长的消息被撤回后无法还原内容",
+    "default": 30
+  },
+  "max_items": {
+    "description": "最多显示条数",
+    "type": "int",
+    "hint": "一次查询最多输出的撤回记录条数",
+    "default": 20
+  },
+  "only_admin": {
+    "description": "仅管理员可用",
+    "type": "bool",
+    "hint": "开启后仅 AstrBot 配置中的管理员可以查询撤回记录",
+    "default": false
+  }
+}

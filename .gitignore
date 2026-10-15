@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境 / 编辑器
+.venv/
+venv/
+.idea/
+.vscode/
+
+# 插件运行时产生的数据
+data/
+*.log
