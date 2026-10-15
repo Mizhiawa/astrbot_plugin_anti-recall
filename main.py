@@ -9,6 +9,7 @@
 import asyncio
 import shutil
 import time
+import traceback
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,6 +34,8 @@ FUZZY_WINDOW_SECONDS = 60
 CACHE_LISTENER_PRIORITY = 100000
 # 单张图片的下载超时（秒）
 IMAGE_TIMEOUT = 15
+# 同时在跑的图片预下载上限，避免在消息密集的群里抢带宽/磁盘
+MAX_CONCURRENT_DOWNLOADS = 8
 # 图片定期清理的最小间隔（秒）
 FILE_SWEEP_INTERVAL = 60
 # 少数消息段的重发占位文案（按组件类名匹配）
@@ -158,14 +161,26 @@ class AntiRecallPlugin(Star):
     )
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def on_onebot_event(self, event: AstrMessageEvent):
-        """监听全部事件：消息入缓存，撤回通知生成记录。"""
-        raw = getattr(event.message_obj, "raw_message", None)
-        post_type = _raw_get(raw, "post_type")
+        """监听全部事件：消息入缓存，撤回通知生成记录。
 
-        if post_type == "message":
-            self._cache_message(event, raw)
-        elif post_type == "notice" and _raw_get(raw, "notice_type") in RECALL_NOTICE_TYPES:
-            self._record_recall(event, raw)
+        这个处理器是纯观察者：不修改事件、不回复、也绝不向外抛异常。
+        它注册在最高优先级上，一旦抛异常，AstrBot 会对该消息 stop_event()
+        并跳过后续所有插件的处理，等于连累其他插件。
+        """
+        try:
+            raw = getattr(event.message_obj, "raw_message", None)
+            post_type = _raw_get(raw, "post_type")
+
+            if post_type == "message":
+                self._cache_message(event, raw)
+            elif (
+                post_type == "notice"
+                and _raw_get(raw, "notice_type") in RECALL_NOTICE_TYPES
+            ):
+                self._record_recall(event, raw)
+        except Exception as e:  # noqa: BLE001
+            detail = traceback.format_exc() if self._debug_enabled() else e
+            logger.warning(f"[防撤回] 缓存消息失败，已忽略该事件：{detail}")
 
     # ---------------------------------------------------------------- 缓存逻辑
 
@@ -309,6 +324,9 @@ class AntiRecallPlugin(Star):
     def _start_download(self, item: MediaItem) -> None:
         """后台下载图片，避免阻塞事件处理链。"""
         if self._images_dir is None:
+            return
+        if len(self._download_tasks) >= MAX_CONCURRENT_DOWNLOADS:
+            # 并发已满，留给查询时按需下载
             return
         try:
             task = asyncio.get_running_loop().create_task(self._materialize_image(item))
