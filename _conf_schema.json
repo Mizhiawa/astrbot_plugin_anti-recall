@@ -17,10 +17,28 @@
     "hint": "一次查询最多输出的撤回记录条数",
     "default": 20
   },
+  "cache_images": {
+    "description": "缓存图片到本地",
+    "type": "bool",
+    "hint": "开启后收到图片时立刻下载到插件数据目录，QQ 图片链接过期也能还原。关闭则查询时按原链接取图，链接失效只能显示 [图片]",
+    "default": true
+  },
+  "fuzzy_match": {
+    "description": "撤回记录兜底匹配",
+    "type": "bool",
+    "hint": "消息 ID 精确匹配失败时，用「同一发送者 + 撤回前 60 秒内」的最近一条缓存消息兜底。关闭后 ID 对不上就直接显示内容不可见",
+    "default": true
+  },
   "only_admin": {
     "description": "仅管理员可用",
     "type": "bool",
     "hint": "开启后仅 AstrBot 配置中的管理员可以查询撤回记录",
+    "default": false
+  },
+  "debug": {
+    "description": "输出诊断日志",
+    "type": "bool",
+    "hint": "开启后逐条打印收到的消息与撤回命中方式（精确/兜底/未命中），排查问题时使用",
     "default": false
   }
 }
