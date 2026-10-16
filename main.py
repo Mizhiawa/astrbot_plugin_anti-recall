@@ -2,11 +2,13 @@
 
 缓存机器人收到的消息；某条消息被撤回后，在会话内发送「防撤回」指令，
 即可看到最近一段时间内被撤回消息的发送者与内容，图片与表情一并还原。
+AstrBot 管理员还可以在任意会话用「防撤回 群号」查询指定群的记录。
 
 仅依赖 AstrBot 自带能力，无需第三方依赖。
 """
 
 import asyncio
+import re
 import shutil
 import time
 import traceback
@@ -50,6 +52,14 @@ PLACEHOLDERS = {
     "Poke": "[戳一戳]",
     "Music": "[音乐]",
 }
+# 从指令参数里提取群号
+GROUP_ID_PATTERN = re.compile(r"\d{5,12}")
+
+
+def _extract_group_id(text) -> str:
+    """取出参数里的群号，兼容「1104325443」「#1104325443」「群1104325443」等写法。"""
+    match = GROUP_ID_PATTERN.search(str(text or ""))
+    return match.group() if match else ""
 
 
 def _raw_get(raw, key: str, default=None):
@@ -100,6 +110,7 @@ class AntiRecallPlugin(Star):
 
     记录收到的消息，消息被撤回后发送「防撤回」指令，即可查看最近一段时间内
     被撤回的消息的发送者与内容（含图片与表情）。
+    AstrBot 管理员可在任意会话用「防撤回 群号」查询指定群。
     """
 
     def __init__(self, context: Context, config: dict | None = None):
@@ -380,15 +391,32 @@ class AntiRecallPlugin(Star):
 
     @filter.command("防撤回")
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
-    async def query_recalls(self, event: AstrMessageEvent):
-        """查看当前会话最近被撤回的消息"""
-        if self._cfg("only_admin", False) and not event.is_admin():
-            yield event.plain_result("该指令仅限管理员使用。")
+    async def query_recalls(self, event: AstrMessageEvent, group_id: str = ""):
+        """查看最近被撤回的消息；管理员可用「防撤回 群号」查询指定群"""
+        target_group = _extract_group_id(group_id)
+        if str(group_id or "").strip() and not target_group:
+            yield event.plain_result("用法：/防撤回（当前会话） 或 /防撤回 群号（管理员）")
             return
+
+        if target_group:
+            # 跨会话查询只对 AstrBot 管理员开放
+            if not event.is_admin():
+                yield event.plain_result("查询指定群的撤回记录需要 AstrBot 管理员权限。")
+                return
+            chat_id = f"group_{target_group}"
+            title = f"群 {target_group} "
+        else:
+            if self._cfg("only_admin", False) and not event.is_admin():
+                yield event.plain_result("该指令仅限管理员使用。")
+                return
+            chat_id = self._chat_id(
+                event,
+                getattr(event.message_obj, "raw_message", None),
+            )
+            title = ""
 
         window = self._cfg_int("window_minutes", 10)
         max_items = self._cfg_int("max_items", 20)
-        chat_id = self._chat_id(event, getattr(event.message_obj, "raw_message", None))
         deadline = time.time() - window * 60
         recent = [
             record
@@ -397,10 +425,10 @@ class AntiRecallPlugin(Star):
         ][-max_items:]
 
         if not recent:
-            yield event.plain_result(f"最近 {window} 分钟内没有被撤回的消息。")
+            yield event.plain_result(f"{title}最近 {window} 分钟内没有被撤回的消息。")
             return
 
-        chain: list = [Plain(f"最近 {window} 分钟内共有 {len(recent)} 条消息被撤回：")]
+        chain: list = [Plain(f"{title}最近 {window} 分钟内共有 {len(recent)} 条消息被撤回：")]
         for index, record in enumerate(recent, 1):
             recalled_at = time.strftime("%H:%M:%S", time.localtime(record.timestamp))
             chain.append(
