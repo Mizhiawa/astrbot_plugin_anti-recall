@@ -8,6 +8,7 @@ AstrBot 管理员还可以在任意会话用「防撤回 群号」查询指定�
 """
 
 import asyncio
+import os
 import re
 import shutil
 import time
@@ -15,6 +16,8 @@ import traceback
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 from uuid import uuid4
 
 from astrbot.api import logger
@@ -36,6 +39,12 @@ FUZZY_WINDOW_SECONDS = 60
 CACHE_LISTENER_PRIORITY = 100000
 # 单张图片的下载超时（秒）
 IMAGE_TIMEOUT = 15
+# 单张图片体积上限，超过则跳过（避免动图/大图占满磁盘）
+IMAGE_MAX_BYTES = 10 * 1024 * 1024
+# 图片目录体积上限的默认值（MB），可用配置项 images_max_mb 覆盖
+IMAGES_MAX_MB_DEFAULT = 200
+# 单张图片最多尝试物化几次（下载失败不无限重试）
+MAX_IMAGE_ATTEMPTS = 2
 # 同时在跑的图片预下载上限，避免在消息密集的群里抢带宽/磁盘
 MAX_CONCURRENT_DOWNLOADS = 8
 # 图片定期清理的最小间隔（秒）
@@ -62,6 +71,20 @@ def _extract_group_id(text) -> str:
     return match.group() if match else ""
 
 
+def _local_path_from_ref(ref: str) -> str | None:
+    """把图片引用解析成本地路径；http(s) 链接返回 None。"""
+    if not ref:
+        return None
+    if ref.startswith(("http://", "https://")):
+        return None
+    if ref.startswith("file://"):
+        try:
+            return url2pathname(urlparse(ref).path)
+        except (ValueError, OSError):
+            return None
+    return ref
+
+
 def _raw_get(raw, key: str, default=None):
     """从 OneBot 原始事件中取值，兼容 aiocqhttp 的 Event(dict) 与普通 dict。"""
     if raw is None:
@@ -79,6 +102,7 @@ class MediaItem:
     kind: str  # text / image / face / other
     value: str  # 文本内容 / 图片引用 / 表情 id / 占位文案
     local_path: str | None = None  # 仅 image：落盘后的本地路径
+    attempts: int = 0  # 仅 image：已尝试物化的次数
 
 
 @dataclass(slots=True)
@@ -120,6 +144,7 @@ class AntiRecallPlugin(Star):
         self._msg_cache: OrderedDict[tuple[str, str], CachedMessage] = OrderedDict()
         self._recalls: deque[RecallRecord] = deque(maxlen=MAX_RECALL_RECORDS)
         self._download_tasks: set[asyncio.Task] = set()
+        self._sweep_task: asyncio.Task | None = None
         self._images_dir: Path | None = self._resolve_images_dir()
         self._last_file_sweep = 0.0
 
@@ -127,9 +152,16 @@ class AntiRecallPlugin(Star):
         logger.info("[防撤回] 插件已加载，开始缓存消息以便查询撤回记录。")
 
     async def terminate(self) -> None:
-        for task in list(self._download_tasks):
+        pending = [*self._download_tasks]
+        if self._sweep_task is not None:
+            pending.append(self._sweep_task)
+        for task in pending:
             task.cancel()
+        if pending:
+            # 等后台任务真正停下再删目录，避免正在落盘的任务报错
+            await asyncio.gather(*pending, return_exceptions=True)
         self._download_tasks.clear()
+        self._sweep_task = None
         self._msg_cache.clear()
         self._recalls.clear()
         if self._images_dir is not None:
@@ -213,8 +245,9 @@ class AntiRecallPlugin(Star):
             elif isinstance(comp, Image):
                 item = MediaItem("image", comp.url or comp.file or comp.path or "")
                 items.append(item)
-                if self._cfg("cache_images", True):
-                    self._start_download(item)
+                # 本地已有的文件直接链接/复制进插件目录（不花网络）；
+                # 只剩 http 链接时才下载（AstrBot 预处理失败时才会出现）
+                self._start_download(item)
             elif isinstance(comp, Face):
                 items.append(MediaItem("face", str(comp.id)))
             elif isinstance(comp, AtAll):
@@ -252,7 +285,7 @@ class AntiRecallPlugin(Star):
             )
 
     def _trim_cache(self) -> None:
-        """丢弃超时与超量的缓存，并定期清理图片文件。"""
+        """丢弃超时与超量的缓存，并把图片清理交给后台线程。"""
         cache_seconds = self._cfg_int("cache_minutes", 30) * 60
         deadline = time.time() - cache_seconds
         while self._msg_cache:
@@ -265,21 +298,60 @@ class AntiRecallPlugin(Star):
             else:
                 break
 
-        if time.time() - self._last_file_sweep < FILE_SWEEP_INTERVAL:
+        self._schedule_sweep(deadline)
+
+    def _schedule_sweep(self, deadline: float) -> None:
+        """在后台线程清理图片，避免同步 IO 卡住事件循环。"""
+        now = time.time()
+        if now - self._last_file_sweep < FILE_SWEEP_INTERVAL:
             return
-        self._last_file_sweep = time.time()
-        self._sweep_files(deadline)
+        if self._sweep_task is not None and not self._sweep_task.done():
+            return
+        self._last_file_sweep = now
+        try:
+            self._sweep_task = asyncio.get_running_loop().create_task(
+                asyncio.to_thread(self._sweep_files, deadline),
+            )
+        except RuntimeError:
+            self._sweep_task = None
 
     def _sweep_files(self, deadline: float) -> None:
-        """删除已超出缓存时长的图片文件。"""
+        """先删超出缓存时长的图片，再按体积上限从最旧的开始淘汰。"""
         if self._images_dir is None or not self._images_dir.exists():
             return
+
+        remaining: list[tuple[float, int, Path]] = []
         for path in self._images_dir.iterdir():
             try:
-                if path.is_file() and path.stat().st_mtime < deadline:
-                    path.unlink()
+                if not path.is_file():
+                    continue
+                file_stat = path.stat()
             except OSError as e:
-                logger.warning(f"[防撤回] 清理图片文件失败 {path.name}: {e}")
+                logger.warning(f"[防撤回] 读取图片文件信息失败 {path.name}: {e}")
+                continue
+            if file_stat.st_mtime < deadline:
+                self._unlink(path)
+                continue
+            remaining.append((file_stat.st_mtime, file_stat.st_size, path))
+
+        max_bytes = self._cfg_int("images_max_mb", IMAGES_MAX_MB_DEFAULT) * 1024 * 1024
+        total = sum(size for _, size, _ in remaining)
+        if total <= max_bytes:
+            return
+        for _, size, path in sorted(remaining):
+            if total <= max_bytes:
+                break
+            if self._unlink(path):
+                total -= size
+
+    @staticmethod
+    def _unlink(path: Path) -> bool:
+        try:
+            path.unlink()
+            return True
+        except OSError as e:
+            logger.warning(f"[防撤回] 清理图片文件失败 {path.name}: {e}")
+            return False
 
     def _record_recall(self, event: AstrMessageEvent, raw) -> None:
         chat_id = self._chat_id(event, raw)
@@ -333,11 +405,9 @@ class AntiRecallPlugin(Star):
     # ---------------------------------------------------------------- 图片处理
 
     def _start_download(self, item: MediaItem) -> None:
-        """后台下载图片，避免阻塞事件处理链。"""
-        if self._images_dir is None:
-            return
+        """后台把图片落到本地，避免阻塞事件处理链。"""
         if len(self._download_tasks) >= MAX_CONCURRENT_DOWNLOADS:
-            # 并发已满，留给查询时按需下载
+            # 并发已满，留给查询时按需物化
             return
         try:
             task = asyncio.get_running_loop().create_task(self._materialize_image(item))
@@ -347,45 +417,105 @@ class AntiRecallPlugin(Star):
         task.add_done_callback(self._download_tasks.discard)
 
     async def _materialize_image(self, item: MediaItem) -> str | None:
-        """把图片落到本地并返回路径；失败返回 None。"""
+        """把图片落到插件目录并返回本地路径；当前拿不到则返回 None。
+
+        输入有两种形态：AstrBot 预处理阶段已经下载好的本地文件（它会把 Image 组件的
+        url 改写成本地临时路径，见 preprocess 的 _normalize_image_component），
+        或尚未下载的 http(s) 链接。前者直接链接/复制进插件目录，后者才需要下载。
+        """
         if item.local_path and Path(item.local_path).exists():
             return item.local_path
-        ref = item.value
-        if not ref:
+        if item.attempts >= MAX_IMAGE_ATTEMPTS or not item.value:
+            item.attempts = MAX_IMAGE_ATTEMPTS
             return None
 
-        if not ref.startswith(("http://", "https://")):
-            # 少数情况下 NapCat 会给本地路径
-            if Path(ref).is_file():
-                item.local_path = ref
-                return ref
+        item.attempts += 1
+        if item.value.startswith(("http://", "https://")):
+            path = await self._fetch_image(item, item.value)
+        else:
+            path = await self._adopt_image(item, item.value)
+
+        if path:
+            item.local_path = path
+        return path
+
+    async def _adopt_image(self, item: MediaItem, ref: str) -> str | None:
+        """把本地已有文件链接/复制进插件目录，使缓存不被外部清理影响。"""
+        source = _local_path_from_ref(ref)
+        if source is None:
+            return None
+        path = Path(source)
+        try:
+            if not path.is_file():
+                return None
+            size = path.stat().st_size
+        except OSError:
             return None
 
+        limit_mb = IMAGE_MAX_BYTES // 1048576
+        if size > IMAGE_MAX_BYTES:
+            logger.warning(f"[防撤回] 图片超过 {limit_mb}MB，已跳过：{path.name}")
+            item.attempts = MAX_IMAGE_ATTEMPTS
+            return None
+        if self._images_dir is None:
+            # 插件数据目录不可用，退化为直接引用（该文件可能被 AstrBot 清理）
+            return source
+        if path.parent == self._images_dir:
+            return source
+
+        target = self._images_dir / (
+            f"{int(time.time() * 1000)}_{uuid4().hex[:8]}{path.suffix or '.img'}"
+        )
+        try:
+            os.link(path, target)  # 同卷硬链接：O(1)，源文件之后被删也不影响
+            return str(target)
+        except OSError:
+            pass
+        try:
+            await asyncio.to_thread(shutil.copy2, path, target)
+            return str(target)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[防撤回] 复制图片失败：{e}")
+            return None
+
+    async def _fetch_image(self, item: MediaItem, url: str) -> str | None:
+        """按链接下载图片到插件目录。"""
         if self._images_dir is None:
             return None
-
         try:
-            image = Image.fromURL(ref)
+            image = Image.fromURL(url)
             temp_path = await asyncio.wait_for(
                 image.convert_to_file_path(),
                 timeout=IMAGE_TIMEOUT,
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[防撤回] 图片下载失败，将退回原始链接：{e}")
+            logger.warning(f"[防撤回] 图片下载失败：{e}")
             return None
 
-        suffix = Path(temp_path).suffix or ".jpg"
-        target = self._images_dir / f"{int(time.time() * 1000)}_{uuid4().hex[:8]}{suffix}"
+        temp = Path(temp_path)
         try:
-            shutil.move(str(temp_path), str(target))
+            size = temp.stat().st_size
+        except OSError:
+            return None
+        limit_mb = IMAGE_MAX_BYTES // 1048576
+        if size > IMAGE_MAX_BYTES:
+            logger.warning(f"[防撤回] 图片超过 {limit_mb}MB，已跳过")
+            item.attempts = MAX_IMAGE_ATTEMPTS
+            return None
+
+        target = self._images_dir / (
+            f"{int(time.time() * 1000)}_{uuid4().hex[:8]}{temp.suffix or '.jpg'}"
+        )
+        try:
+            await asyncio.to_thread(shutil.move, str(temp), str(target))
+            return str(target)
         except Exception:  # noqa: BLE001
             try:
-                shutil.copy2(str(temp_path), str(target))
+                await asyncio.to_thread(shutil.copy2, str(temp), str(target))
+                return str(target)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[防撤回] 保存图片失败：{e}")
                 return None
-        item.local_path = str(target)
-        return item.local_path
 
     # ---------------------------------------------------------------- 查询指令
 
@@ -441,7 +571,14 @@ class AntiRecallPlugin(Star):
         yield event.chain_result(chain)
 
     async def _render_items(self, items: list[MediaItem]) -> list:
-        """把消息段快照还原成可发送的组件。"""
+        """把消息段快照还原成可发送的组件；图片并发物化，避免逐张串行等待。"""
+        image_items = [item for item in items if item.kind == "image"]
+        if image_items:
+            await asyncio.gather(
+                *(self._materialize_image(item) for item in image_items),
+                return_exceptions=True,
+            )
+
         rendered: list = []
         for item in items:
             if item.kind == "text":
@@ -452,10 +589,9 @@ class AntiRecallPlugin(Star):
                 except (TypeError, ValueError):
                     rendered.append(Plain("[表情]"))
             elif item.kind == "image":
-                path = await self._materialize_image(item)
-                if path:
+                if item.local_path and Path(item.local_path).exists():
                     try:
-                        rendered.append(Image.fromFileSystem(path))
+                        rendered.append(Image.fromFileSystem(item.local_path))
                         continue
                     except Exception as e:  # noqa: BLE001
                         logger.warning(f"[防撤回] 构造图片消息段失败：{e}")

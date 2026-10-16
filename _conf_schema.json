@@ -17,11 +17,11 @@
     "hint": "一次查询最多输出的撤回记录条数",
     "default": 20
   },
-  "cache_images": {
-    "description": "缓存图片到本地",
-    "type": "bool",
-    "hint": "开启后收到图片时立刻下载到插件数据目录，QQ 图片链接过期也能还原。关闭则查询时按原链接取图，链接失效只能显示 [图片]",
-    "default": true
+  "images_max_mb": {
+    "description": "图片目录体积上限（MB）",
+    "type": "int",
+    "hint": "图片缓存占用超过该值时，从最旧的开始删除。单张超过 10MB 的图片会被直接跳过",
+    "default": 200
   },
   "fuzzy_match": {
     "description": "撤回记录兜底匹配",
@@ -32,7 +32,7 @@
   "only_admin": {
     "description": "仅管理员可用",
     "type": "bool",
-    "hint": "开启后仅 AstrBot 配置中的管理员可以查询撤回记录",
+    "hint": "开启后仅 AstrBot 配置中的管理员可以查询撤回记录（带群号的跨群查询始终只对管理员开放）",
     "default": false
   },
   "debug": {

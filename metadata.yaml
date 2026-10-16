@@ -2,7 +2,7 @@ name: astrbot_plugin_anti_recall
 display_name: 防撤回查询
 desc: 记录机器人收到的消息，消息被撤回后可在会话内发送「防撤回」指令，查看最近一段时间内被撤回消息的发送者与内容（含图片与表情）；管理员可用「防撤回 群号」查询指定群
 short_desc: 查看最近被撤回的消息（含图片）
-version: v1.2.0
+version: v1.3.0
 author: Mizhiawa
 repo: https://github.com/Mizhiawa/astrbot_plugin_anti-recall
 support_platforms:
