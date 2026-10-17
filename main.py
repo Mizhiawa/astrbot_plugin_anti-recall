@@ -45,6 +45,11 @@ IMAGE_MAX_BYTES = 10 * 1024 * 1024
 IMAGES_MAX_MB_DEFAULT = 200
 # 单张图片最多尝试物化几次（下载失败不无限重试）
 MAX_IMAGE_ATTEMPTS = 2
+# AstrBot 的事件是并发处理的，撤回通知可能先于消息事件到达；
+# 先挂起这么久等迟到的消息事件，等不到再做兜底匹配
+PENDING_RECALL_TTL = 5.0
+# 同时挂起的撤回记录上限
+MAX_PENDING_RECALLS = 20
 # 同时在跑的图片预下载上限，避免在消息密集的群里抢带宽/磁盘
 MAX_CONCURRENT_DOWNLOADS = 8
 # 图片定期清理的最小间隔（秒）
@@ -143,7 +148,10 @@ class AntiRecallPlugin(Star):
         # key: (会话标识, 消息 ID)
         self._msg_cache: OrderedDict[tuple[str, str], CachedMessage] = OrderedDict()
         self._recalls: deque[RecallRecord] = deque(maxlen=MAX_RECALL_RECORDS)
+        # (会话标识, 消息 ID) -> 已生成但内容待补齐的撤回记录
+        self._pending: OrderedDict[tuple[str, str], RecallRecord] = OrderedDict()
         self._download_tasks: set[asyncio.Task] = set()
+        self._pending_tasks: set[asyncio.Task] = set()
         self._sweep_task: asyncio.Task | None = None
         self._images_dir: Path | None = self._resolve_images_dir()
         self._last_file_sweep = 0.0
@@ -152,7 +160,7 @@ class AntiRecallPlugin(Star):
         logger.info("[防撤回] 插件已加载，开始缓存消息以便查询撤回记录。")
 
     async def terminate(self) -> None:
-        pending = [*self._download_tasks]
+        pending = [*self._download_tasks, *self._pending_tasks]
         if self._sweep_task is not None:
             pending.append(self._sweep_task)
         for task in pending:
@@ -161,7 +169,9 @@ class AntiRecallPlugin(Star):
             # 等后台任务真正停下再删目录，避免正在落盘的任务报错
             await asyncio.gather(*pending, return_exceptions=True)
         self._download_tasks.clear()
+        self._pending_tasks.clear()
         self._sweep_task = None
+        self._pending.clear()
         self._msg_cache.clear()
         self._recalls.clear()
         if self._images_dir is not None:
@@ -275,6 +285,17 @@ class AntiRecallPlugin(Star):
             timestamp=time.time(),
         )
         self._msg_cache[(chat_id, cached.message_id)] = cached
+
+        # 撤回通知可能比这条消息事件先到（事件并发处理），到了就地补齐记录
+        pending = self._pending.pop((chat_id, cached.message_id), None)
+        if pending is not None:
+            self._msg_cache.pop((chat_id, cached.message_id), None)
+            self._enrich(pending, cached)
+            logger.info(
+                f"[防撤回] 迟到的消息事件补齐了撤回记录 chat={chat_id} "
+                f"id={cached.message_id}",
+            )
+
         self._trim_cache()
 
         if self._debug_enabled():
@@ -357,37 +378,96 @@ class AntiRecallPlugin(Star):
         chat_id = self._chat_id(event, raw)
         message_id = str(_raw_get(raw, "message_id"))
         author_id = str(_raw_get(raw, "user_id") or "")
+        now = time.time()
 
         cached = self._msg_cache.pop((chat_id, message_id), None)
-        hit = "精确"
         if cached is not None:
-            pass
-        elif author_id and self._cfg("fuzzy_match", True):
-            cached = self._take_fuzzy(chat_id, author_id)
-            hit = "兜底" if cached is not None else "未命中"
-        else:
-            hit = "未命中"
+            record = self._build_record(chat_id, cached, now)
+            self._recalls.append(record)
+            logger.info(
+                f"[防撤回] {record.sender_name}({record.sender_id}) 在 {chat_id} "
+                f"撤回了一条消息（精确）：{record.content}",
+            )
+            return
 
+        # 索引不到：多半是撤回通知先于消息事件到达，先挂起等它，等不到再兜底匹配
         record = RecallRecord(
             chat_id=chat_id,
-            sender_id=cached.sender_id if cached else author_id,
-            sender_name=(cached.sender_name if cached else "") or author_id,
-            content=cached.content if cached else "[消息未在缓存中，内容不可见]",
-            timestamp=time.time(),
-            items=cached.items if cached else [],
+            sender_id=author_id,
+            sender_name=author_id,
+            content="[消息未在缓存中，内容不可见]",
+            timestamp=now,
         )
         self._recalls.append(record)
+        self._track_pending(chat_id, message_id, record)
         logger.info(
-            f"[防撤回] {record.sender_name}({record.sender_id}) 在 {chat_id} "
-            f"撤回了一条消息（{hit}）：{record.content}",
+            f"[防撤回] {author_id} 在 {chat_id} 撤回了一条消息（等待消息事件补齐）："
+            f"{record.content}",
         )
 
-        if self._debug_enabled() and cached is None:
+        if self._debug_enabled():
             recent_ids = [key[1] for key in self._msg_cache if key[0] == chat_id][-10:]
             logger.info(
                 f"[防撤回] 未命中详情 chat={chat_id} 通知id={message_id} "
                 f"作者={author_id} 该会话最近缓存id={recent_ids}",
             )
+
+    @staticmethod
+    def _build_record(
+        chat_id: str,
+        cached: CachedMessage,
+        timestamp: float,
+    ) -> RecallRecord:
+        return RecallRecord(
+            chat_id=chat_id,
+            sender_id=cached.sender_id,
+            sender_name=cached.sender_name,
+            content=cached.content,
+            timestamp=timestamp,
+            items=cached.items,
+        )
+
+    @staticmethod
+    def _enrich(record: RecallRecord, cached: CachedMessage) -> None:
+        """把撤回记录的内容替换为缓存里的真实消息。"""
+        record.sender_id = cached.sender_id
+        record.sender_name = cached.sender_name
+        record.content = cached.content
+        record.items = cached.items
+
+    def _track_pending(
+        self,
+        chat_id: str,
+        message_id: str,
+        record: RecallRecord,
+    ) -> None:
+        """挂起一条等待消息事件补齐的撤回记录。"""
+        key = (chat_id, message_id)
+        self._pending[key] = record
+        self._pending.move_to_end(key)
+        while len(self._pending) > MAX_PENDING_RECALLS:
+            self._pending.popitem(last=False)
+        try:
+            task = asyncio.get_running_loop().create_task(self._wait_pending(key))
+        except RuntimeError:
+            return
+        self._pending_tasks.add(task)
+        task.add_done_callback(self._pending_tasks.discard)
+
+    async def _wait_pending(self, key: tuple[str, str]) -> None:
+        """等迟到的消息事件；等不到再尝试兜底匹配。"""
+        await asyncio.sleep(PENDING_RECALL_TTL)
+        record = self._pending.pop(key, None)
+        if record is None:
+            return  # 已被迟到的消息事件补齐
+        if not self._cfg("fuzzy_match", True) or not record.sender_id:
+            return
+
+        cached = self._take_fuzzy(record.chat_id, record.sender_id)
+        if cached is None:
+            return
+        self._enrich(record, cached)
+        logger.info(f"[防撤回] 撤回记录用兜底匹配补齐：{record.content}")
 
     def _take_fuzzy(self, chat_id: str, author_id: str) -> CachedMessage | None:
         """兜底匹配：同会话、同作者、时间邻近的最近一条未认领缓存消息。"""
