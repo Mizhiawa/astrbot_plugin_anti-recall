@@ -31,8 +31,6 @@ MAX_CACHE_SIZE = 2000
 MAX_RECALL_RECORDS = 200
 # 撤回通知的 OneBot 类型
 RECALL_NOTICE_TYPES = ("group_recall", "friend_recall")
-# 兜底匹配窗口：撤回时间与原消息时间相差不超过该值（秒）
-FUZZY_WINDOW_SECONDS = 60
 # 缓存监听器的优先级。AstrBot 中该值越大越先执行（默认 0），且前一个处理器调用
 # stop_event() 后，后面的处理器会被直接跳过。静默监听类插件往往会拦掉非唤醒消息，
 # 这里取一个足够大的值，保证消息总能在被拦截之前进入缓存。
@@ -46,10 +44,10 @@ IMAGES_MAX_MB_DEFAULT = 200
 # 单张图片最多尝试物化几次（下载失败不无限重试）
 MAX_IMAGE_ATTEMPTS = 2
 # AstrBot 的事件是并发处理的，撤回通知可能先于消息事件到达；
-# 先挂起这么久等迟到的消息事件，等不到再做兜底匹配
-PENDING_RECALL_TTL = 5.0
+# 先挂起这么久等迟到的消息事件（等不到就保持「内容不可见」）
+PENDING_RECALL_TTL = 60.0
 # 同时挂起的撤回记录上限
-MAX_PENDING_RECALLS = 20
+MAX_PENDING_RECALLS = 50
 # 同时在跑的图片预下载上限，避免在消息密集的群里抢带宽/磁盘
 MAX_CONCURRENT_DOWNLOADS = 8
 # 图片定期清理的最小间隔（秒）
@@ -335,6 +333,8 @@ class AntiRecallPlugin(Star):
             )
         except RuntimeError:
             self._sweep_task = None
+            return
+        self._sweep_task.add_done_callback(self._log_task_exception)
 
     def _sweep_files(self, deadline: float) -> None:
         """先删超出缓存时长的图片，再按体积上限从最旧的开始淘汰。"""
@@ -453,34 +453,20 @@ class AntiRecallPlugin(Star):
             return
         self._pending_tasks.add(task)
         task.add_done_callback(self._pending_tasks.discard)
+        task.add_done_callback(self._log_task_exception)
 
     async def _wait_pending(self, key: tuple[str, str]) -> None:
-        """等迟到的消息事件；等不到再尝试兜底匹配。"""
+        """等迟到的消息事件；等不到就保持「内容不可见」，并留下诊断信息。"""
         await asyncio.sleep(PENDING_RECALL_TTL)
         record = self._pending.pop(key, None)
         if record is None:
             return  # 已被迟到的消息事件补齐
-        if not self._cfg("fuzzy_match", True) or not record.sender_id:
-            return
-
-        cached = self._take_fuzzy(record.chat_id, record.sender_id)
-        if cached is None:
-            return
-        self._enrich(record, cached)
-        logger.info(f"[防撤回] 撤回记录用兜底匹配补齐：{record.content}")
-
-    def _take_fuzzy(self, chat_id: str, author_id: str) -> CachedMessage | None:
-        """兜底匹配：同会话、同作者、时间邻近的最近一条未认领缓存消息。"""
-        deadline = time.time() - FUZZY_WINDOW_SECONDS
-        for key in list(reversed(self._msg_cache)):
-            cached = self._msg_cache[key]
-            if (
-                key[0] == chat_id
-                and cached.sender_id == author_id
-                and cached.timestamp >= deadline
-            ):
-                return self._msg_cache.pop(key)
-        return None
+        recent_ids = [k[1] for k in self._msg_cache if k[0] == record.chat_id][-5:]
+        logger.info(
+            f"[防撤回] 撤回记录未能在 {PENDING_RECALL_TTL:.0f}s 内补齐 "
+            f"chat={record.chat_id} id={key[1]} 作者={record.sender_id} "
+            f"该会话最近缓存id={recent_ids}（消息事件可能被管道前段拦截）",
+        )
 
     # ---------------------------------------------------------------- 图片处理
 
@@ -495,6 +481,16 @@ class AntiRecallPlugin(Star):
             return
         self._download_tasks.add(task)
         task.add_done_callback(self._download_tasks.discard)
+        task.add_done_callback(self._log_task_exception)
+
+    @staticmethod
+    def _log_task_exception(task: asyncio.Task) -> None:
+        """后台任务的异常默认会被静默丢弃，这里显式记一条，便于事后定位。"""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(f"[防撤回] 后台任务异常：{exc!r}")
 
     async def _materialize_image(self, item: MediaItem) -> str | None:
         """把图片落到插件目录并返回本地路径；当前拿不到则返回 None。

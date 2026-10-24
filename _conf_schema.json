@@ -23,12 +23,6 @@
     "hint": "图片缓存占用超过该值时，从最旧的开始删除。单张超过 10MB 的图片会被直接跳过",
     "default": 200
   },
-  "fuzzy_match": {
-    "description": "撤回记录兜底匹配",
-    "type": "bool",
-    "hint": "消息 ID 精确匹配失败时，用「同一发送者 + 撤回前 60 秒内」的最近一条缓存消息兜底。关闭后 ID 对不上就直接显示内容不可见",
-    "default": true
-  },
   "only_admin": {
     "description": "仅管理员可用",
     "type": "bool",
