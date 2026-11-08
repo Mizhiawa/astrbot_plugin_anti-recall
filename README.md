@@ -19,7 +19,17 @@ https://github.com/Mizhiawa/astrbot_plugin_anti-recall
 
 安装完成后插件目录为 `data/plugins/astrbot_plugin_anti_recall`，重启或重载插件即可生效。
 
-**方式二：手动安装**
+**方式二：离线安装 / 更新（服务器连不上 GitHub 时）**
+
+AstrBot 更新插件时要下载 `github.com/<owner>/<repo>/archive/HEAD.zip`（会跳转到 `codeload.github.com`），
+国内云服务器经常连不上，日志里表现为 `httpx.ConnectError: All connection attempts failed`。
+这时直接把插件包上传即可：
+
+1. 在本机（能访问 GitHub）下载仓库 zip，或用现成的 `astrbot_plugin_anti_recall-<版本>.zip`；
+2. AstrBot 面板 → 插件管理 → 「从文件安装 / 上传插件」选择这个 zip；
+3. 上传前建议先在面板里卸载旧版本（同名目录会被覆盖，但配置项以 `_conf_schema.json` 为准）。
+
+**方式三：手动安装**
 
 把本目录放到 AstrBot 的 `data/plugins/` 下，然后在插件管理页重载。
 
@@ -111,6 +121,7 @@ https://github.com/Mizhiawa/astrbot_plugin_anti-recall
 2. 看插件日志：
    - 有 `缓存消息 chat=... id=...` → 缓存正常，再看撤回记录那行：写「精确」表示直接命中；写「等待消息事件补齐」说明通知先到了，随后应能看到 `迟到的消息事件补齐了撤回记录`；若看到 `撤回记录未能在 60s 内补齐`，说明那条消息的事件被管道前段拦掉了（限流 / 内容安全 / 会话状态等），日志里会同时打印该会话最近的缓存 ID 便于对照。
    - 完全没有 `缓存消息` → 消息在管道更早的阶段就被拦掉了，检查 AstrBot 的限流、会话状态、内容安全等设置。
+   - 出现 `消息晚了 N 秒才到达处理器 ... rate_limit=30/60s/stall` → 是 AstrBot 的**限流排队**。`event_bus` 的日志在派发前就打印了，而限流会让管道持锁 sleep 到下一个窗口，所以日志里有消息、缓存里却还没有。群聊消息密集时（默认 30 条/60 秒）消息事件可能被推迟几十秒到几分钟，这期间撤回必然显示「内容不可见」。可在 AstrBot 平台设置里调大 `rate_limit.count`（或设为 0 关闭），重启后生效；插件侧的挂起窗口会跟着 `cache_minutes` 一直等，事件最终到达后会自动补齐内容。
 
 ## 文件结构
 
@@ -119,11 +130,13 @@ astrbot_plugin_anti-recall/
 ├── main.py            # 插件主体：消息缓存、撤回记录、图片落盘、查询指令
 ├── metadata.yaml      # 插件元数据（name / desc / version / author / repo）
 ├── _conf_schema.json  # 插件配置项定义
+├── tests/selftest.py  # 自检脚本（桩环境，python tests/selftest.py）
 └── README.md
 ```
 
 ## 版本
 
+- v1.3.3：挂起窗口跟随 `cache_minutes`（不再用定时任务，按需清理），新增「消息迟到」诊断；自检脚本移入 `tests/selftest.py`。
 - v1.3.2：删除猜测式兜底匹配（它会造成内容错位、并吃掉未撤回消息的缓存）；等待窗口从 5 秒改为 60 秒；后台任务异常显式记录日志。
 - v1.3.1：修复极快撤回时显示「内容不可见」——撤回通知可能先于消息事件到达（AstrBot 事件并发处理），现在挂起等迟到的消息事件并原地补齐。
 - v1.3.0：图片字节改由插件自己持有（硬链接/复制），不再依赖 AstrBot 临时目录的存活；新增单张与总量体积上限；清理移到后台线程；查询时图片并发物化；去掉 `cache_images` 配置项（本地已有文件必然链接/复制，只剩链接时才下载）。

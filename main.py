@@ -43,11 +43,14 @@ IMAGE_MAX_BYTES = 10 * 1024 * 1024
 IMAGES_MAX_MB_DEFAULT = 200
 # 单张图片最多尝试物化几次（下载失败不无限重试）
 MAX_IMAGE_ATTEMPTS = 2
-# AstrBot 的事件是并发处理的，撤回通知可能先于消息事件到达；
-# 先挂起这么久等迟到的消息事件（等不到就保持「内容不可见」）
-PENDING_RECALL_TTL = 60.0
+# 撤回通知可能先于消息事件到达（事件并发 + AstrBot 默认限流会排队），
+# 挂起的撤回记录一直等消息事件到达，等待上限取 cache_minutes，最少 60 秒
+PENDING_TTL_FLOOR = 60.0
 # 同时挂起的撤回记录上限
 MAX_PENDING_RECALLS = 50
+# 消息事件比平台消息时间晚了多少秒就提示一次（限流 stall 会让它长时间排队）
+LATE_WARN_SECONDS = 30
+LATE_WARN_INTERVAL = 60.0
 # 同时在跑的图片预下载上限，避免在消息密集的群里抢带宽/磁盘
 MAX_CONCURRENT_DOWNLOADS = 8
 # 图片定期清理的最小间隔（秒）
@@ -146,19 +149,21 @@ class AntiRecallPlugin(Star):
         # key: (会话标识, 消息 ID)
         self._msg_cache: OrderedDict[tuple[str, str], CachedMessage] = OrderedDict()
         self._recalls: deque[RecallRecord] = deque(maxlen=MAX_RECALL_RECORDS)
-        # (会话标识, 消息 ID) -> 已生成但内容待补齐的撤回记录
-        self._pending: OrderedDict[tuple[str, str], RecallRecord] = OrderedDict()
+        # (会话标识, 消息 ID) -> (待补齐的撤回记录, 等待截止时间)
+        self._pending: OrderedDict[
+            tuple[str, str], tuple[RecallRecord, float]
+        ] = OrderedDict()
         self._download_tasks: set[asyncio.Task] = set()
-        self._pending_tasks: set[asyncio.Task] = set()
         self._sweep_task: asyncio.Task | None = None
         self._images_dir: Path | None = self._resolve_images_dir()
         self._last_file_sweep = 0.0
+        self._last_late_warn = 0.0
 
     async def initialize(self) -> None:
         logger.info("[防撤回] 插件已加载，开始缓存消息以便查询撤回记录。")
 
     async def terminate(self) -> None:
-        pending = [*self._download_tasks, *self._pending_tasks]
+        pending = [*self._download_tasks]
         if self._sweep_task is not None:
             pending.append(self._sweep_task)
         for task in pending:
@@ -167,7 +172,6 @@ class AntiRecallPlugin(Star):
             # 等后台任务真正停下再删目录，避免正在落盘的任务报错
             await asyncio.gather(*pending, return_exceptions=True)
         self._download_tasks.clear()
-        self._pending_tasks.clear()
         self._sweep_task = None
         self._pending.clear()
         self._msg_cache.clear()
@@ -273,6 +277,7 @@ class AntiRecallPlugin(Star):
             return
 
         chat_id = self._chat_id(event, raw)
+        self._warn_if_late(chat_id, raw)
         content = event.get_message_outline().strip() or event.get_message_str().strip()
         cached = CachedMessage(
             message_id=str(message_id),
@@ -288,7 +293,7 @@ class AntiRecallPlugin(Star):
         pending = self._pending.pop((chat_id, cached.message_id), None)
         if pending is not None:
             self._msg_cache.pop((chat_id, cached.message_id), None)
-            self._enrich(pending, cached)
+            self._enrich(pending[0], cached)
             logger.info(
                 f"[防撤回] 迟到的消息事件补齐了撤回记录 chat={chat_id} "
                 f"id={cached.message_id}",
@@ -302,6 +307,35 @@ class AntiRecallPlugin(Star):
                 f"from={cached.sender_name}({cached.sender_id}) "
                 f"items={[item.kind for item in cached.items]}",
             )
+
+    def _warn_if_late(self, chat_id: str, raw) -> None:
+        """消息事件被限流排队、很晚才到处理器时提示一次，便于定位查不到缓存的原因。"""
+        try:
+            delay = time.time() - float(_raw_get(raw, "time"))
+        except (TypeError, ValueError):
+            return
+        if delay < LATE_WARN_SECONDS:
+            return
+        now = time.time()
+        if now - self._last_late_warn < LATE_WARN_INTERVAL:
+            return
+        self._last_late_warn = now
+        logger.info(
+            f"[防撤回] 消息晚了 {delay:.0f} 秒才到达处理器 chat={chat_id}，"
+            f"可能是 AstrBot 限流排队（platform_settings.rate_limit="
+            f"{self._rate_limit_info()}）",
+        )
+
+    def _rate_limit_info(self) -> str:
+        try:
+            config = self.context.get_config() or {}
+            rate_limit = (config.get("platform_settings") or {}).get("rate_limit") or {}
+            return (
+                f"{rate_limit.get('count')}/{rate_limit.get('time')}s/"
+                f"{rate_limit.get('strategy')}"
+            )
+        except Exception:  # noqa: BLE001
+            return "未知"
 
     def _trim_cache(self) -> None:
         """丢弃超时与超量的缓存，并把图片清理交给后台线程。"""
@@ -435,37 +469,43 @@ class AntiRecallPlugin(Star):
         record.content = cached.content
         record.items = cached.items
 
+    def _pending_ttl(self) -> float:
+        """挂起窗口跟着缓存时长走：消息事件晚到几分钟也仍能补齐。"""
+        return max(PENDING_TTL_FLOOR, self._cfg_int("cache_minutes", 30) * 60)
+
     def _track_pending(
         self,
         chat_id: str,
         message_id: str,
         record: RecallRecord,
     ) -> None:
-        """挂起一条等待消息事件补齐的撤回记录。"""
+        """挂起一条等待消息事件补齐的撤回记录（不用定时任务，按需清理）。"""
+        now = time.time()
+        self._prune_pending(now)
+
         key = (chat_id, message_id)
-        self._pending[key] = record
+        self._pending[key] = (record, now + self._pending_ttl())
         self._pending.move_to_end(key)
         while len(self._pending) > MAX_PENDING_RECALLS:
             self._pending.popitem(last=False)
-        try:
-            task = asyncio.get_running_loop().create_task(self._wait_pending(key))
-        except RuntimeError:
-            return
-        self._pending_tasks.add(task)
-        task.add_done_callback(self._pending_tasks.discard)
-        task.add_done_callback(self._log_task_exception)
 
-    async def _wait_pending(self, key: tuple[str, str]) -> None:
-        """等迟到的消息事件；等不到就保持「内容不可见」，并留下诊断信息。"""
-        await asyncio.sleep(PENDING_RECALL_TTL)
-        record = self._pending.pop(key, None)
-        if record is None:
-            return  # 已被迟到的消息事件补齐
+    def _prune_pending(self, now: float) -> None:
+        """丢掉已过等待窗口的挂起记录，并为它们留一条诊断日志。"""
+        while self._pending:
+            key = next(iter(self._pending))
+            record, deadline = self._pending[key]
+            if deadline > now:
+                break
+            self._pending.popitem(last=False)
+            self._log_unresolved(key, record)
+
+    def _log_unresolved(self, key: tuple[str, str], record: RecallRecord) -> None:
         recent_ids = [k[1] for k in self._msg_cache if k[0] == record.chat_id][-5:]
         logger.info(
-            f"[防撤回] 撤回记录未能在 {PENDING_RECALL_TTL:.0f}s 内补齐 "
+            f"[防撤回] 撤回记录未能在 {self._pending_ttl():.0f}s 内补齐 "
             f"chat={record.chat_id} id={key[1]} 作者={record.sender_id} "
-            f"该会话最近缓存id={recent_ids}（消息事件可能被管道前段拦截）",
+            f"该会话最近缓存id={recent_ids}"
+            "（消息事件可能被管道前段拦截，或严重滞后于限流排队）",
         )
 
     # ---------------------------------------------------------------- 图片处理
